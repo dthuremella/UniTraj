@@ -51,6 +51,7 @@ class BaseDataset(Dataset):
             self.starting_frame = self.config['starting_frame'][cnt]
             if self.config['use_cache'] or is_ddp():
                 file_list = self.get_data_list(data_usage_this_dataset)
+                # import pdb; pdb.set_trace()
             else:
                 if os.path.exists(self.cache_path) and self.config.get('overwrite_cache', False) is False:
                     print('Warning: cache path {} already exists, skip '.format(self.cache_path))
@@ -651,14 +652,17 @@ class BaseDataset(Dataset):
         center_objects_list = []
         track_index_to_predict_selected = []
         selected_type = self.config['object_type']
-        selected_type = [object_type[x] for x in selected_type]
+        selected_type = [object_type[x] for x in selected_type] # (Divya) only do for nuScenes?
         for k in range(len(track_index_to_predict)):
             obj_idx = track_index_to_predict[k]
 
             if obj_trajs_full[obj_idx, current_time_index, -1] == 0:
                 print(f'Warning: obj_idx={obj_idx} is not valid at time step {current_time_index}, scene_id={scene_id}')
                 continue
-            if obj_types[obj_idx] not in selected_type:
+            
+            obj_type_normalized = int(obj_types[obj_idx]) if str(obj_types[obj_idx]).isdigit() else obj_types[obj_idx]
+            if obj_type_normalized not in selected_type:
+                print(f"DEBUG: obj_type={repr(obj_types[obj_idx])} -> normalized={repr(obj_type_normalized)}, config types={selected_type}") # (Divya) 
                 print(f'Warning: object type in data is not a selected type for scene_id={scene_id}')
                 continue
 

@@ -11,6 +11,112 @@ from torch.optim.lr_scheduler import MultiStepLR
 
 from unitraj.models.base_model.base_model import BaseModel
 
+from torch import Tensor
+from unitraj.models.mtr.transformer.transformer_encoder_layer import viz, moe, SHARED, NUMEXPERTS, TOPK, upsample_hard, harmonic, cls_token, first_agent, curr_timestep, final_timestep
+if moe:
+    from unitraj.models.mtr.transformer.transformer_encoder_layer import moe_transformer_mlp, moe_gate
+    from unitraj.models.mtr.transformer.transformer_encoder_layer import concatdim, T_OBS, NUM_AGENTS, moe_types
+    div_by = 1 #TOPK + SHARED
+
+    class MoETransformerEncoderLayer(nn.TransformerEncoderLayer):
+        def __init__(self, d_model, nhead, dropout=0.1, dim_feedforward=2048, activation="relu", layer_norm_eps=1e-5,
+                    batch_first=False, norm_first=False, bias=True, device=None, dtype=None, layer_type=None):
+            super(MoETransformerEncoderLayer, self).__init__(d_model=d_model, nhead=nhead, dropout=dropout,
+                                                            dim_feedforward=dim_feedforward, activation=activation,
+                                                            layer_norm_eps=layer_norm_eps, 
+                                                            batch_first=batch_first,
+                                                            norm_first=norm_first, bias=bias, device=device, dtype=dtype)
+            if moe:
+                if concatdim:
+                    if layer_type == 'temporal':
+                        d_model *= NUM_AGENTS
+                        dim_feedforward *= NUM_AGENTS
+                    elif layer_type == 'social':
+                        d_model *= T_OBS
+                        dim_feedforward *= T_OBS
+                self.activation_with_dropout = lambda x: self.dropout(self.activation(x))
+                self.moe_ffn = moe_transformer_mlp(d_model=d_model, d_hidden=int(dim_feedforward / div_by), gate=moe_gate,
+                            num_expert=NUMEXPERTS, top_k=TOPK, activation=self.activation_with_dropout)
+                self.linear1, self.linear2 = None, None
+            if SHARED > 0:
+                self.linear1_shared = nn.Linear(d_model, int(dim_feedforward / div_by), bias=bias)
+                self.dropout_shared = nn.Dropout(dropout)
+                self.linear2_shared = nn.Linear(int(dim_feedforward / div_by), d_model, bias=bias)
+
+            if harmonic:
+                self.avg_expert_idx = 0 # for harmonic MoE
+
+            if viz:
+                self.scores = {}
+
+        # feed forward block
+        def _ff_block(self, x: Tensor) -> Tensor:
+            if moe:
+                ret = {}
+                self.scores = {}
+                if viz:
+                    x = self.moe_ffn(x, ret)
+                    self.scores['gate_score_e'] = ret.get("gate_score", None)
+                    self.scores['top_k_idx_e'] = ret.get("top_k_idx", None)
+                    ret = {}
+                elif harmonic:
+                    x = self.moe_ffn(x, ret)
+                    self.avg_expert_idx += ret.get("avg_expert_idx", 0).item()
+                else:
+                    x = self.moe_ffn(x)
+            else:
+                x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+            if SHARED > 0:
+                x_shared = self.linear2_shared(self.dropout_shared(self.activation(self.linear1_shared(x))))
+                x = (TOPK * x + SHARED * x_shared) / (TOPK + SHARED)
+            return self.dropout2(x)
+
+    class MoETransformerDecoderLayer(nn.TransformerDecoderLayer):
+        def __init__(self, d_model, nhead, dropout=0.1, dim_feedforward=2048, activation="relu", layer_norm_eps=1e-5,
+                    batch_first=False, norm_first=False, bias=True, device=None, dtype=None):
+            super(MoETransformerDecoderLayer, self).__init__(d_model=d_model, nhead=nhead, dropout=dropout,
+                                                            dim_feedforward=dim_feedforward, activation=activation,
+                                                            layer_norm_eps=layer_norm_eps, 
+                                                            batch_first=batch_first,
+                                                            norm_first=norm_first, bias=bias, device=device, dtype=dtype)
+            if moe:
+                self.activation_with_dropout = lambda x: self.dropout(self.activation(x))
+                self.moe_ffn = moe_transformer_mlp(d_model=d_model, d_hidden=int(dim_feedforward / div_by), gate=moe_gate,
+                            num_expert=NUMEXPERTS, top_k=TOPK, activation=self.activation_with_dropout)
+                self.linear2, self.linear1 = None, None
+
+            if SHARED > 0:
+                self.linear1_shared = nn.Linear(d_model, int(dim_feedforward / div_by), bias=bias)
+                self.dropout_shared = nn.Dropout(dropout)
+                self.linear2_shared = nn.Linear(int(dim_feedforward / div_by), d_model, bias=bias)
+
+            if harmonic:
+                self.avg_expert_idx = 0 # for harmonic MoE
+
+            if viz:
+                self.scores = {}
+
+        # feed forward block
+        def _ff_block(self, x: Tensor) -> Tensor:
+            if moe:
+                ret = {}
+                self.scores = {}
+                if viz:
+                    x = self.moe_ffn(x, ret)
+                    self.scores['gate_score_d'] = ret.get("gate_score", None)
+                    self.scores['top_k_idx_d'] = ret.get("top_k_idx", None)
+                    ret = {}
+                elif harmonic:
+                    x = self.moe_ffn(x, ret)
+                    self.avg_expert_idx += ret.get("avg_expert_idx", 0).item()
+                else:
+                    x = self.moe_ffn(x)
+            else:
+                x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+            if SHARED > 0:
+                x_shared = self.linear2_shared(self.dropout_shared(self.activation(self.linear1_shared(x))))
+                x = (TOPK * x + SHARED * x_shared) / (TOPK + SHARED)
+            return self.dropout3(x)
 
 class MapEncoderCNN(nn.Module):
     '''
@@ -189,16 +295,29 @@ class AutoBotEgo(BaseModel):
         # INPUT ENCODERS
         self.agents_dynamic_encoder = nn.Sequential(init_(nn.Linear(self.k_attr, self.d_k)))
 
+        self.scores = None
+        transformer_encoder_layer = MoETransformerEncoderLayer if moe and ('social' in moe_types or 'temporal' in moe_types) else nn.TransformerEncoderLayer
+        transformer_decoder_layer = MoETransformerDecoderLayer if moe and ('decoder' in moe_types) else nn.TransformerDecoderLayer
+        if cls_token:
+            self.cls_token_temporal = nn.Parameter(torch.Tensor(1, NUM_AGENTS, self.d_k), requires_grad=True)
+            nn.init.trunc_normal_(self.cls_token_temporal, std=0.02)
+            self.cls_token_social = nn.Parameter(torch.Tensor(T_OBS + 1, 1, self.d_k), requires_grad=True)
+            nn.init.trunc_normal_(self.cls_token_social, std=0.02)
+            self.cls_token_decoder = nn.Parameter(torch.Tensor(1, 1, self.d_k), requires_grad=True)
+            nn.init.trunc_normal_(self.cls_token_decoder, std=0.02)
+
         # ============================== AutoBot-Ego ENCODER ==============================
         self.social_attn_layers = []
         self.temporal_attn_layers = []
         for _ in range(self.L_enc):
-            tx_encoder_layer = nn.TransformerEncoderLayer(d_model=self.d_k, nhead=self.num_heads, dropout=self.dropout,
-                                                          dim_feedforward=self.tx_hidden_size)
+            if moe and ('social' in moe_types): tx_encoder_layer = transformer_encoder_layer(d_model=self.d_k, nhead=self.num_heads, dropout=self.dropout, dim_feedforward=self.tx_hidden_size, layer_type='social')
+            else: tx_encoder_layer = transformer_encoder_layer(d_model=self.d_k, nhead=self.num_heads, dropout=self.dropout, dim_feedforward=self.tx_hidden_size)
+
             self.social_attn_layers.append(nn.TransformerEncoder(tx_encoder_layer, num_layers=1))
 
-            tx_encoder_layer = nn.TransformerEncoderLayer(d_model=self.d_k, nhead=self.num_heads, dropout=self.dropout,
-                                                          dim_feedforward=self.tx_hidden_size)
+            if moe and ('temporal' in moe_types): tx_encoder_layer = transformer_encoder_layer(d_model=self.d_k, nhead=self.num_heads, dropout=self.dropout, dim_feedforward=self.tx_hidden_size, layer_type='temporal')
+            else: tx_encoder_layer = transformer_encoder_layer(d_model=self.d_k, nhead=self.num_heads, dropout=self.dropout, dim_feedforward=self.tx_hidden_size)
+
             self.temporal_attn_layers.append(nn.TransformerEncoder(tx_encoder_layer, num_layers=1))
 
         self.temporal_attn_layers = nn.ModuleList(self.temporal_attn_layers)
@@ -214,13 +333,13 @@ class AutoBotEgo(BaseModel):
 
         self.tx_decoder = []
         for _ in range(self.L_dec):
-            self.tx_decoder.append(nn.TransformerDecoderLayer(d_model=self.d_k, nhead=self.num_heads,
+            self.tx_decoder.append(transformer_decoder_layer(d_model=self.d_k, nhead=self.num_heads,
                                                               dropout=self.dropout,
                                                               dim_feedforward=self.tx_hidden_size))
         self.tx_decoder = nn.ModuleList(self.tx_decoder)
 
         # ============================== Positional encoder ==============================
-        self.pos_encoder = PositionalEncoding(self.d_k, dropout=0.0, max_len=self.past)
+        self.pos_encoder = PositionalEncoding(self.d_k, dropout=0.0, max_len=self.past+1 if cls_token else self.past)
 
         # ============================== OUTPUT MODEL ==============================
         self.output_model = OutputModel(d_k=self.d_k)
@@ -238,6 +357,18 @@ class AutoBotEgo(BaseModel):
 
         self.fisher_information = None
         self.optimal_params = None
+
+    def update_tau(self, epoch):
+        if not moe:
+            return
+        num_epochs = self.config['max_epochs'] * 0.7 # should finish training in 70%
+        tau_start = self.config['tau_start']
+        tau_final = self.config['tau_final']
+        tau = max(tau_final, tau_start * (tau_final / tau_start) ** (epoch / num_epochs))
+        for transformer_type in [self.temporal_attn_layers, self.social_attn_layers, self.tx_decoder]:
+            for layer in transformer_type:
+                for sub_layer in layer.layers:
+                    sub_layer.moe_ffn.gate.tau = tau
 
     def generate_decoder_mask(self, seq_len, device):
         ''' For masking out the subsequent info. '''
@@ -308,11 +439,20 @@ class AutoBotEgo(BaseModel):
         ego_tensor, _agents_tensor, opps_masks, env_masks = self.process_observations(ego_in, agents_in)
         agents_tensor = torch.cat((ego_tensor.unsqueeze(2), _agents_tensor), dim=2)
 
-        agents_emb = self.agents_dynamic_encoder(agents_tensor).permute(1, 0, 2, 3)
+        agents_emb = self.agents_dynamic_encoder(agents_tensor)
+        if cls_token:
+            agents_emb = torch.cat((self.cls_token_temporal.expand(B,-1,-1,-1), agents_emb),dim=1)
+            opps_masks = torch.cat((torch.ones(B, 1, NUM_AGENTS).to(opps_masks.device).bool(), opps_masks), dim=1)
+            agents_emb = torch.cat((self.cls_token_social.expand(B,-1,-1,-1), agents_emb),dim=2)
+            opps_masks = torch.cat((torch.ones(B, T_OBS + 1, 1).to(opps_masks.device).bool(), opps_masks), dim=2)        
+        agents_emb = agents_emb.permute(1, 0, 2, 3)
         # Process through AutoBot's encoder
         for i in range(self.L_enc):
             agents_emb = self.temporal_attn_fn(agents_emb, opps_masks, layer=self.temporal_attn_layers[i])
             agents_emb = self.social_attn_fn(agents_emb, opps_masks, layer=self.social_attn_layers[i])
+        if cls_token:
+            agents_emb = agents_emb[1:, :, 1:]
+
         ego_soctemp_emb = agents_emb[:, :, 0]  # take ego-agent encodings only.
 
         orig_map_features, orig_road_segs_masks = self.map_encoder(roads, ego_soctemp_emb)
@@ -325,12 +465,17 @@ class AutoBotEgo(BaseModel):
 
         # AutoBot-Ego Decoding
         out_seq = self.Q.repeat(1, B, 1, 1).view(self.T, B * self.c, -1)
-        time_masks = self.generate_decoder_mask(seq_len=self.T, device=ego_in.device)
+        time_masks = self.generate_decoder_mask(seq_len=self.T+1 if cls_token else self.T, device=ego_in.device)
+        if cls_token:
+            out_seq = torch.cat((self.cls_token_decoder.expand(-1, B * self.c, -1), out_seq), dim=0)
+
         for d in range(self.L_dec):
             ego_dec_emb_map = self.map_attn_layers(query=out_seq, key=map_features, value=map_features,
                                                    key_padding_mask=road_segs_masks)[0]
             out_seq = out_seq + ego_dec_emb_map
             out_seq = self.tx_decoder[d](out_seq, context, tgt_mask=time_masks, memory_key_padding_mask=env_masks)
+        if cls_token: 
+            out_seq = out_seq[1:]
         out_dists = self.output_model(out_seq).reshape(self.T, B, self.c, -1).permute(2, 0, 1, 3)
 
         # Mode prediction
@@ -350,6 +495,7 @@ class AutoBotEgo(BaseModel):
         return output
 
     def forward(self, batch):
+        self.scores = {'gate_score_e_temporal': [], 'top_k_idx_e_temporal': [], 'gate_score_e_social': [], 'top_k_idx_e_social': [], 'gate_score_d': [], 'top_k_idx_d': []} if moe and viz else None
         model_input = {}
         inputs = batch['input_dict']
         agents_in, agents_mask, roads = inputs['obj_trajs'], inputs['obj_trajs_mask'], inputs['map_polylines']
@@ -373,6 +519,40 @@ class AutoBotEgo(BaseModel):
         #     loss = self.get_loss(batch, output)
         # else:
         #     loss = 0
+        self.output = output
+        if moe and viz:
+            B, T_obs, num_agents, T_fut = agents_in.shape[0], agents_in.shape[1], agents_in.shape[2] + 1, self.T
+            if cls_token: 
+                    T_obs += 1
+                    num_agents += 1
+                    T_fut += 1
+            if 'temporal' in moe_types:
+                for layer in self.temporal_attn_layers:
+                    for sub_layer in layer.layers:
+                        if cls_token or first_agent:
+                            self.scores['gate_score_e_temporal'].append(sub_layer.scores.get('gate_score_e', None).permute(1, 0, 2))
+                            self.scores['top_k_idx_e_temporal'].append(sub_layer.scores.get('top_k_idx_e', None).permute(1, 0, 2))
+                        else:  
+                            self.scores['gate_score_e_temporal'].append(sub_layer.scores.get('gate_score_e', None).view(T_obs, B, num_agents, -1).permute(1, 0, 2, 3))
+                            self.scores['top_k_idx_e_temporal'].append(sub_layer.scores.get('top_k_idx_e', None).view(T_obs, B, num_agents, -1).permute(1, 0, 2, 3))
+            if 'social' in moe_types:
+                for layer in self.social_attn_layers:
+                    for sub_layer in layer.layers:
+                        if cls_token or curr_timestep:
+                            self.scores['gate_score_e_social'].append(sub_layer.scores.get('gate_score_e', None).permute(1, 0, 2))
+                            self.scores['top_k_idx_e_social'].append(sub_layer.scores.get('top_k_idx_e', None).permute(1, 0, 2))
+                        else:
+                            self.scores['gate_score_e_social'].append(sub_layer.scores.get('gate_score_e', None).view(num_agents, B, T_obs, -1).permute(1, 2, 0, 3))
+                            self.scores['top_k_idx_e_social'].append(sub_layer.scores.get('top_k_idx_e', None).view(num_agents, B, T_obs, -1).permute(1, 2, 0, 3))
+            if 'decoder' in moe_types:
+                for layer in self.tx_decoder:
+                    if cls_token or final_timestep:
+                        self.scores['gate_score_d'].append(layer.scores.get('gate_score_d', None).reshape(B, self.c, -1))
+                        self.scores['top_k_idx_d'].append(layer.scores.get('top_k_idx_d', None).reshape(B, self.c, -1))
+
+                    else:
+                        self.scores['gate_score_d'].append(layer.scores.get('gate_score_d', None).reshape(T_fut, B, self.c, -1).permute(1, 0, 2, 3))
+                        self.scores['top_k_idx_d'].append(layer.scores.get('top_k_idx_d', None).reshape(T_fut, B, self.c, -1).permute(1, 0, 2, 3))
 
         return output, loss
 
@@ -381,12 +561,21 @@ class AutoBotEgo(BaseModel):
         ground_truth = torch.cat([inputs['center_gt_trajs'][..., :2], inputs['center_gt_trajs_mask'].unsqueeze(-1)],
                                  dim=-1)
         loss = self.criterion(prediction, ground_truth, inputs['center_gt_final_valid_idx'])
+        if harmonic and moe:
+            avg_expert_idx = 0
+            alpha = self.config['harmonic_alpha']
+            for transformer_type in [self.temporal_attn_layers, self.social_attn_layers]:
+                for layer in transformer_type:
+                    for sub_layer in layer.layers:
+                        avg_expert_idx += sub_layer.avg_expert_idx
+            for layer in self.tx_decoder:
+                avg_expert_idx += layer.avg_expert_idx
+            loss = loss + alpha * avg_expert_idx
         return loss
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.config['learning_rate'], eps=0.0001)
-        scheduler = MultiStepLR(optimizer, milestones=self.config['learning_rate_sched'], gamma=0.5,
-                                verbose=True)
+        scheduler = MultiStepLR(optimizer, milestones=self.config['learning_rate_sched'], gamma=0.5)
         return [optimizer], [scheduler]
 
 
@@ -502,6 +691,16 @@ class Criterion(nn.Module):
 
         # post_entropy
         final_loss = loss + kl_loss + adefde_loss
+
+        if upsample_hard: 
+            # --- ADD: per-sample loss (no gradient needed) ---
+            with torch.no_grad():
+                per_sample = torch.zeros(data.size(0), device=data.device)
+                for kk in range(modes):
+                    nll_k = self.nll_pytorch_dist(pred[kk].transpose(0, 1), data, mask, rtn_loss=True)
+                    per_sample += nll_k * post_pr[:, kk]   # shape [B]
+                self.per_sample  = per_sample
+            # --- END ADD ---
 
         return final_loss
 

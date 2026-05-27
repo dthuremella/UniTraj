@@ -15,7 +15,9 @@ from torch import nn, Tensor
 
 from .multi_head_attention import MultiheadAttention
 from .multi_head_attention_local import MultiheadAttentionLocal
-from .transformer_encoder_layer import _get_activation_fn
+from .transformer_encoder_layer import _get_activation_fn, moe, SHARED
+if moe:
+    from .transformer_encoder_layer import moe_transformer_mlp, moe_gate, NUMEXPERTS, TOPK, viz
 
 
 class TransformerDecoderLayer(nn.Module):
@@ -55,19 +57,31 @@ class TransformerDecoderLayer(nn.Module):
         self.nhead = nhead
         self.rm_self_attn_decoder = rm_self_attn_decoder
 
-        # Implementation of Feedforward model
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.activation = _get_activation_fn(activation)
+        self.scores = {} # for visualization
+        if moe:
+            self.dropout = nn.Dropout(dropout)
+            self.activation_with_dropout = lambda x: self.dropout(self.activation(x))
+            self.moe_ffn = moe_transformer_mlp(d_model=d_model, d_hidden=int(dim_feedforward / (TOPK + SHARED)), gate=moe_gate,
+                        num_expert=NUMEXPERTS, top_k=TOPK, activation=self.activation_with_dropout)
+        else:
+            # Implementation of Feedforward model
+            self.linear1 = nn.Linear(d_model, dim_feedforward)
+            self.dropout = nn.Dropout(dropout)
+            self.linear2 = nn.Linear(dim_feedforward, d_model)
+        if SHARED > 0:
+            self.linear1_shared = nn.Linear(d_model, int(dim_feedforward / (TOPK + SHARED)))
+            self.dropout_shared = nn.Dropout(dropout)
+            self.linear2_shared = nn.Linear(int(dim_feedforward / (TOPK + SHARED)), d_model)
 
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
 
-        self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
         self.keep_query_pos = keep_query_pos
+        self.avg_expert_idx = 0 # for harmonic MoE
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
@@ -209,7 +223,24 @@ class TransformerDecoderLayer(nn.Module):
 
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        if moe:
+            ret = {}
+            scores = {}
+            if viz:
+                tgt2 = self.moe_ffn(tgt, ret)
+                self.scores['gate_score_d'] = ret.get("gate_score", None)
+                self.scores['top_k_idx_d'] = ret.get("top_k_idx", None)
+                ret = {}
+            elif harmonic:
+                tgt2 = self.moe_ffn(tgt, ret)
+                self.avg_expert_idx += ret.get("avg_expert_idx", 0)
+            else:
+                tgt2 = self.moe_ffn(tgt)
+        else:
+            tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt)))) # original code
+        if SHARED > 0:
+            tgt2_shared = self.linear2_shared(self.dropout_shared(self.activation(self.linear1_shared(tgt))))
+            tgt2 = (TOPK * tgt2 + SHARED * tgt2_shared) / (TOPK + SHARED)
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
         return tgt

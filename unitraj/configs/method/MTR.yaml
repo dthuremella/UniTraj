@@ -49,7 +49,7 @@ lr_decay: 0.5
 lr_clip: 0.000001
 WEIGHT_DECAY: 0.01
 train_batch_size: 256 #32 #128
-eval_batch_size: 512 #32 #128
+eval_batch_size: 256 #32 #128
 
 # data related
 max_num_agents: 64

@@ -19,6 +19,7 @@ from unitraj.models.mtr.MTR_utils import PointNetPolylineEncoder, get_batch_offs
 from unitraj.models.mtr.ops.knn import knn_utils
 from unitraj.models.mtr.transformer import transformer_decoder_layer, position_encoding_utils, \
     transformer_encoder_layer
+from unitraj.models.mtr.transformer.transformer_encoder_layer import viz
 
 Type_dict = {0: 'UNSET', 1: 'VEHICLE', 2: 'PEDESTRIAN', 3: 'CYCLIST'}
 
@@ -40,10 +41,19 @@ class MotionTransformer(BaseModel):
             in_channels=self.context_encoder.num_out_channels,
             config=self.model_cfg.MOTION_DECODER
         )
+        if viz:
+            self.scores = {} # for visualization
 
     def forward(self, batch):
+        self.scores = {} # reset scores for each forward pass
         enc_dict = self.context_encoder(batch)
         out_dict = self.motion_decoder(enc_dict)
+        if viz:
+            for key in self.context_encoder.scores:
+                self.scores[key] = self.context_encoder.scores[key]
+            for key in self.motion_decoder.scores:
+                self.scores[key] = self.motion_decoder.scores[key]
+            self.out_dict = out_dict # for visualization
 
         mode_probs, out_dists = out_dict['pred_list'][-1]
         output = {}
@@ -76,7 +86,7 @@ class MotionTransformer(BaseModel):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.config['learning_rate'],
                                       weight_decay=self.config['weight_decay'])
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lbmd, last_epoch=-1, verbose=True)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lbmd, last_epoch=-1) #, verbose=True)
         return [optimizer], [scheduler]
 
 
@@ -114,6 +124,8 @@ class MTREncoder(nn.Module):
 
         self.self_attn_layers = nn.ModuleList(self_attn_layers)
         self.num_out_channels = self.model_cfg.D_MODEL
+        if viz:
+            self.scores = {} # for visualization
 
     def build_polyline_encoder(self, in_channels, hidden_dim, num_layers, num_pre_layers=1, out_channels=None):
         ret_polyline_encoder = PointNetPolylineEncoder(
@@ -150,12 +162,18 @@ class MTREncoder(nn.Module):
 
         pos_embedding = position_encoding_utils.gen_sineembed_for_position(x_pos_t, hidden_dim=d_model)
 
+        if viz:
+            self.scores['gate_score_e_global'] = []
+            self.scores['top_k_idx_e_global'] = []
         for k in range(len(self.self_attn_layers)):
             x_t = self.self_attn_layers[k](
                 src=x_t,
                 src_key_padding_mask=~x_mask_t,
                 pos=pos_embedding
             )
+            if viz:
+                self.scores['gate_score_e_global'].append(self.self_attn_layers[k].scores['gate_score_e'])
+                self.scores['top_k_idx_e_global'].append(self.self_attn_layers[k].scores['top_k_idx_e'])
         x_out = x_t.permute(1, 0, 2)  # (batch_size, N, d_model)
         return x_out
 
@@ -194,6 +212,9 @@ class MTREncoder(nn.Module):
 
         # local attn
         output = x_stack
+        if viz:
+            self.scores['gate_score_e_local'] = []
+            self.scores['top_k_idx_e_local'] = []
         for k in range(len(self.self_attn_layers)):
             output = self.self_attn_layers[k](
                 src=output,
@@ -203,6 +224,9 @@ class MTREncoder(nn.Module):
                 key_batch_cnt=batch_cnt,
                 index_pair_batch=batch_idxs
             )
+            if viz:
+                self.scores['gate_score_e_local'].append(self.self_attn_layers[k].scores['gate_score_e'])
+                self.scores['top_k_idx_e_local'].append(self.self_attn_layers[k].scores['top_k_idx_e'])
 
         ret_full_feature = torch.zeros_like(x_stack_full)  # (batch_size * N, d_model)
         ret_full_feature[x_mask_stack] = output
@@ -336,6 +360,8 @@ class MTRDecoder(nn.Module):
         )
 
         self.forward_ret_dict = {}
+        if viz:
+            self.scores = {} # for visualization
 
     def build_dense_future_prediction_layers(self, hidden_dim, num_future_frames):
         self.obj_pos_encoding_layer = build_mlps(
@@ -383,6 +409,7 @@ class MTRDecoder(nn.Module):
 
             intention_points = {}
             for cur_type in self.object_type:
+                # cur_intention_points = intention_points_dict[Type_dict.get(cur_type, cur_type)] # (Divya) should work for av2 (and nuScenes) since the intention_points_dict keys can be either int or str depending on the dataset
                 cur_intention_points = intention_points_dict[cur_type]
                 cur_intention_points = torch.from_numpy(cur_intention_points).float().view(-1, 2)
                 intention_points[cur_type] = cur_intention_points
@@ -446,6 +473,7 @@ class MTRDecoder(nn.Module):
         else:
             intention_points = torch.stack([
                 self.intention_points[Type_dict[center_objects_type[obj_idx]]]
+                # self.intention_points[center_objects_type[obj_idx]] # (Divya) for av2, 
                 for obj_idx in range(num_center_objects)], dim=0).cuda()
             intention_points = intention_points.permute(1, 0, 2)  # (num_query, num_center_objects, 2)
 
@@ -584,6 +612,11 @@ class MTRDecoder(nn.Module):
         pred_waypoints = intention_points.permute(1, 0, 2)[:, :, None, :]  # (num_center_objects, num_query, 1, 2)
         dynamic_query_center = intention_points
 
+        if viz:
+            self.scores['gate_score_d_obj'] = []
+            self.scores['top_k_idx_d_obj'] = []
+            self.scores['gate_score_d_map'] = []
+            self.scores['top_k_idx_d_map'] = []
         pred_list = []
         for layer_idx in range(self.num_decoder_layers):
             # query object feature
@@ -594,6 +627,9 @@ class MTRDecoder(nn.Module):
                 dynamic_query_center=dynamic_query_center,
                 layer_idx=layer_idx
             )
+            if viz:
+                self.scores['gate_score_d_obj'].append(self.obj_decoder_layers[layer_idx].scores['gate_score_d'])
+                self.scores['top_k_idx_d_obj'].append(self.obj_decoder_layers[layer_idx].scores['top_k_idx_d'])
 
             # query map feature
             collected_idxs, base_map_idxs = self.apply_dynamic_map_collection(
@@ -617,6 +653,9 @@ class MTRDecoder(nn.Module):
                 query_content_pre_mlp=self.map_query_content_mlps[layer_idx],
                 query_embed_pre_mlp=self.map_query_embed_mlps
             )
+            if viz:
+                self.scores['gate_score_d_map'].append(self.map_decoder_layers[layer_idx].scores['gate_score_d'])
+                self.scores['top_k_idx_d_map'].append(self.map_decoder_layers[layer_idx].scores['top_k_idx_d'])
 
             query_feature = torch.cat([center_objects_feature, obj_query_feature, map_query_feature], dim=-1)
             query_content = self.query_feature_fusion_layers[layer_idx](

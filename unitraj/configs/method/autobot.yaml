@@ -4,7 +4,7 @@ num_modes: 6
 hidden_size: 128
 num_encoder_layers: 2
 num_decoder_layers: 2
-tx_hidden_size: 384
+tx_hidden_size: 384 # to see the 2x, 8x, etc models, multiply this param
 tx_num_heads: 16
 dropout: 0.1
 entropy_weight: 40.0
@@ -21,6 +21,11 @@ ewc_lambda: 2000
 train_batch_size: 128 #32 #128
 eval_batch_size: 256 #32 #128
 grad_clip_norm: 5
+
+# moe
+# tau_start: 1.0  #tau doesnt seem to help
+# tau_final: 0.3 # should be 0.1-0.2 if shared, 0.3-0.5 else
+# harmonic_alpha: 1
 
 # data related
 max_num_agents: 15
