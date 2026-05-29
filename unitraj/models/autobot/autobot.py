@@ -12,7 +12,7 @@ from torch.optim.lr_scheduler import MultiStepLR
 from unitraj.models.base_model.base_model import BaseModel
 
 from torch import Tensor
-from unitraj.models.mtr.transformer.transformer_encoder_layer import viz, moe, SHARED, NUMEXPERTS, TOPK, upsample_hard, harmonic, cls_token, first_agent, curr_timestep, final_timestep
+from unitraj.models.mtr.transformer.transformer_encoder_layer import viz, moe, SHARED, NUMEXPERTS, TOPK, upsample_hard, harmonic, cls_token, first_agent, curr_timestep, final_timestep, decoder2x
 if moe:
     from unitraj.models.mtr.transformer.transformer_encoder_layer import moe_transformer_mlp, moe_gate
     from unitraj.models.mtr.transformer.transformer_encoder_layer import concatdim, T_OBS, NUM_AGENTS, moe_types
@@ -335,7 +335,7 @@ class AutoBotEgo(BaseModel):
         for _ in range(self.L_dec):
             self.tx_decoder.append(transformer_decoder_layer(d_model=self.d_k, nhead=self.num_heads,
                                                               dropout=self.dropout,
-                                                              dim_feedforward=self.tx_hidden_size))
+                                                              dim_feedforward=self.tx_hidden_size*2 if decoder2x else self.tx_hidden_size))
         self.tx_decoder = nn.ModuleList(self.tx_decoder)
 
         # ============================== Positional encoder ==============================

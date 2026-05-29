@@ -4,7 +4,7 @@ num_modes: 6
 hidden_size: 128
 num_encoder_layers: 2
 num_decoder_layers: 2
-tx_hidden_size: 384 # to see the 2x, 8x, etc models, multiply this param
+tx_hidden_size: 384 # for 2x (768), 8x, etc models, multiply this param
 tx_num_heads: 16
 dropout: 0.1
 entropy_weight: 40.0

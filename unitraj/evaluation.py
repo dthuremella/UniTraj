@@ -14,6 +14,41 @@ from pytorch_lightning.callbacks import Callback
 from models.mtr.transformer.transformer_encoder_layer import viz, TOPK, moe
 from train import moe_name
 import pickle
+import sys
+
+measure_flops = False
+
+def register_flop_hooks(model):
+    def count_expert_flops(module, input, output):
+        inp = input[0]
+        tokens = inp.shape[0]
+        d_model = inp.shape[1]
+        d_hidden = module.htoh4.out_feat
+        flops = 2 * tokens * (d_model * d_hidden + d_hidden * d_model)
+        module._flop_count += flops
+
+    def count_linear_flops(module, input, output):
+        inp = input[0]
+        tokens = inp.numel() // inp.shape[-1]
+        flops = 2 * tokens * inp.shape[-1] * output.shape[-1]
+        module._flop_count += flops
+
+    for name, module in model.named_modules():
+        if type(module).__name__ in ('_Expert', '_ExpertPrint'):
+            module._flop_count = 0
+            module.register_forward_hook(count_expert_flops)
+        elif type(module) == torch.nn.Linear:
+            module._flop_count = 0
+            module.register_forward_hook(count_linear_flops)
+
+def print_flops(model):
+    total_flops = sum(m._flop_count for m in model.modules() if hasattr(m, '_flop_count'))
+    print(f"\n=== FLOPs Report ===")
+    print(f"Total FLOPs: {total_flops:.3e}")
+    print("\nPer module breakdown:")
+    for name, module in model.named_modules():
+        if hasattr(module, '_flop_count') and module._flop_count > 0:
+            print(f"  {name}: {module._flop_count:.3e}")
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def evaluation(cfg):
@@ -31,6 +66,23 @@ def evaluation(cfg):
     val_loader = DataLoader(
         val_set, batch_size=eval_batch_size, num_workers=cfg.load_num_workers, shuffle=False, drop_last=False,
         collate_fn=val_set.collate_fn)
+
+    callbacks_list = []
+    if measure_flops:
+        # register flop hooks right after model is built
+        register_flop_hooks(model)
+        class FlopsCallback(Callback):
+            def __init__(self):
+                self.batch_count = 0
+
+            def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+                self.batch_count += 1
+                if self.batch_count == 2:
+                    # batch 1 was warmup, batch 2 is our measurement
+                    print_flops(model)
+                    sys.exit(0)
+
+        callbacks_list.append(FlopsCallback())
 
     if viz:
         class ScoreSaver(Callback):
@@ -81,6 +133,7 @@ def evaluation(cfg):
                     self.kalman.append(input_dict['kalman_difficulty'].cpu())
                     self.traj_types.append(input_dict['trajectory_type'].cpu())
         score_saver = ScoreSaver()
+        callbacks_list.append(score_saver)
 
     trainer = pl.Trainer(
         inference_mode=True,
@@ -88,7 +141,7 @@ def evaluation(cfg):
         devices=1,
         accelerator="cpu" if cfg.debug else "gpu",
         profiler="simple",
-        callbacks=[score_saver] if viz else None,
+        callbacks=callbacks_list if callbacks_list else None,
     )
 
     trainer.validate(model=model, dataloaders=val_loader, ckpt_path=cfg.ckpt_path)

@@ -17,13 +17,17 @@ from .multi_head_attention import MultiheadAttention
 from .multi_head_attention_local import MultiheadAttentionLocal
 
 from fmoe.layers import _fmoe_general_global_forward, fmoe_faster_schedule
+
+# options for all models:
 viz = False
+decoder2x = False # (for baseline model) making the decoder twice the size
+upsample_hard = False
+
+# options for MOE models only:
 moe = False
 NUMEXPERTS = 32
 TOPK = 2
 SHARED = 0
-
-upsample_hard = False
 
 first_agent = False # only use the first agent's tokens for routing
 curr_timestep = False # only use the current timestep's tokens for routing

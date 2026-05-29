@@ -14,12 +14,12 @@ import hydra
 from omegaconf import OmegaConf
 import os
 
-from models.mtr.transformer.transformer_encoder_layer import viz, moe, SHARED, NUMEXPERTS, TOPK, upsample_hard, harmonic, diff_init, concatdim, first_agent, curr_timestep, final_timestep, cls_token, moe_types
+from models.mtr.transformer.transformer_encoder_layer import viz, moe, SHARED, NUMEXPERTS, TOPK, upsample_hard, harmonic, diff_init, concatdim, first_agent, curr_timestep, final_timestep, cls_token, moe_types, decoder2x
 
 if moe:
     moe_name = f'fmoe-{TOPK}k{SHARED}s{NUMEXPERTS}e{"S" if "social" in moe_types else ""}{"T" if "temporal" in moe_types else ""}{"D" if "decoder" in moe_types else ""}{"_upsample" if upsample_hard else ""}{"_harmonic" if harmonic else ""}{"_diffinit" if diff_init else ""}{"_concatdim" if concatdim else ""}{"_agent0" if first_agent else ""}{"_currT" if curr_timestep else ""}{"_finalT" if final_timestep else ""}{"_cls" if cls_token else ""}-' 
 else:
-    moe_name = ''
+    moe_name = f'{"_upsample" if upsample_hard else ""}{"_decoder2x" if decoder2x else ""}'
 
 restore_best_weights = False  # Set to True to enable restoring best weights after each validation
 print( f"RESTORE best weights after each validation: {restore_best_weights}")
@@ -228,9 +228,9 @@ def train(cfg):
     if upsample_hard:
         # Give the model a way to find the callback's accumulator
         trainer._hard_sampler_callback = hard_sampler_cb
+        trainer.fit(model=model, train_dataloaders=None, val_dataloaders=val_loader, ckpt_path=cfg.ckpt_path)
 
-    trainer.fit(model=model, train_dataloaders=None, val_dataloaders=val_loader, ckpt_path=cfg.ckpt_path)
-
+    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=cfg.ckpt_path)
 
 if __name__ == '__main__':
     train()
