@@ -11,9 +11,9 @@ exp_name: 'autobot_train' # name that will be used in wandb
 
 # ckpt_path: '/home/x_divth/project/code/moe/UniTraj/checkpoints/autobot_epoch72_brierfde=2.47.ckpt' # baseline checkpoint path, used for evaluation
 # ckpt_path: '/home/x_divth/project/code/moe/UniTraj/checkpoints/fmoe2k32e-autobot_epoch99_brierfde=2.36.ckpt' # fmoe2k32e checkpoint path, used for evaluation
-# ckpt_path: '/home/x_divth/project/code/moe/UniTraj/checkpoints/fmoe-2k0s32e_currT-autobot_epoch65_brierfde=2.39.ckpt' #checkpoint path, for eval
+ckpt_path: '/home/x_divth/project/code/moe/UniTraj/checkpoints/384autobot_decoder2x_epoch98_brier_fde=2.37.ckpt' #checkpoint path, for eval
 # ckpt_path: '/home/x_divth/project/code/moe/UniTraj/checkpoints/fmoe-2k0s32eSTD_upsample-autobot/last.ckpt' # fmoe8e2 checkpoint path, used for evaluation
-ckpt_path: null
+# ckpt_path: null
 seed: 42 # random seed
 debug: False # debug mode, will use cpu only
 devices: [ 0 ] # gpu ids

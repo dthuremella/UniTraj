@@ -16,7 +16,7 @@ from train import moe_name
 import pickle
 import sys
 
-measure_flops = False
+measure_flops = True
 
 def register_flop_hooks(model):
     def count_expert_flops(module, input, output):
@@ -34,7 +34,7 @@ def register_flop_hooks(model):
         module._flop_count += flops
 
     for name, module in model.named_modules():
-        if type(module).__name__ in ('_Expert', '_ExpertPrint'):
+        if type(module).__name__ in ('_Expert', '_ExpertDiffInit'):
             module._flop_count = 0
             module.register_forward_hook(count_expert_flops)
         elif type(module) == torch.nn.Linear:

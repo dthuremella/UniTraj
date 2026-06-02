@@ -176,7 +176,7 @@ def train(cfg):
     call_backs = []
 
     checkpoint_callback = ModelCheckpoint(
-        dirpath=f'/home/x_divth/project/code/moe/UniTraj/checkpoints/{moe_name}{cfg.tx_hidden_size if not moe else ""}{cfg.harmonic_alpha if harmonic else ""}{cfg.method.model_name}/',
+        dirpath=f'/home/x_divth/project/code/moe/UniTraj/checkpoints/{cfg.tx_hidden_size if not moe else ""}{moe_name}{cfg.harmonic_alpha if harmonic else ""}{cfg.method.model_name}/',
         monitor='val/brier_fde',  # Replace with your validation metric
         filename='{epoch}-{val/brier_fde:.2f}',
         save_top_k=1, # save the top k checkpoints, set to -1 to save all checkpoints
