@@ -4,7 +4,7 @@ num_modes: 6
 hidden_size: 128
 num_encoder_layers: 2
 num_decoder_layers: 2
-tx_hidden_size: 384 # for 2x (768), 8x, etc models, multiply this param
+tx_hidden_size: 384 #OG: 384 # for 2x (768), 8x, etc models, multiply this param
 tx_num_heads: 16
 dropout: 0.1
 entropy_weight: 40.0
@@ -12,7 +12,7 @@ kl_weight: 20.0
 use_FDEADE_aux_loss: True
 
 # train
-max_epochs: 100 #150 #40
+max_epochs: 300 #150 #40
 learning_rate: 0.00075 # 0.00075 # 1e-3 for lanegcn
 learning_rate_sched: [ 10, 20, 30, 40, 50 ]
 optimizer: Adam #According to PyTorch naming
@@ -25,7 +25,7 @@ grad_clip_norm: 5
 # moe
 # tau_start: 1.0  #tau doesnt seem to help
 # tau_final: 0.3 # should be 0.1-0.2 if shared, 0.3-0.5 else
-# harmonic_alpha: 1
+harmonic_alpha: 1
 
 # data related
 max_num_agents: 15

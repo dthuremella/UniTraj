@@ -45,10 +45,10 @@ def print_flops(model):
     total_flops = sum(m._flop_count for m in model.modules() if hasattr(m, '_flop_count'))
     print(f"\n=== FLOPs Report ===")
     print(f"Total FLOPs: {total_flops:.3e}")
-    print("\nPer module breakdown:")
-    for name, module in model.named_modules():
-        if hasattr(module, '_flop_count') and module._flop_count > 0:
-            print(f"  {name}: {module._flop_count:.3e}")
+    # print("\nPer module breakdown:")
+    # for name, module in model.named_modules():
+    #     if hasattr(module, '_flop_count') and module._flop_count > 0:
+    #         print(f"  {name}: {module._flop_count:.3e}")
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def evaluation(cfg):
@@ -80,7 +80,7 @@ def evaluation(cfg):
                 if self.batch_count == 2:
                     # batch 1 was warmup, batch 2 is our measurement
                     print_flops(model)
-                    sys.exit(0)
+                    # sys.exit(0)
 
         callbacks_list.append(FlopsCallback())
 

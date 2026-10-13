@@ -17,6 +17,7 @@ if moe:
     from unitraj.models.mtr.transformer.transformer_encoder_layer import moe_transformer_mlp, moe_gate
     from unitraj.models.mtr.transformer.transformer_encoder_layer import concatdim, T_OBS, NUM_AGENTS, moe_types
     div_by = 1 #TOPK + SHARED
+    div_by_shared = 4
 
     class MoETransformerEncoderLayer(nn.TransformerEncoderLayer):
         def __init__(self, d_model, nhead, dropout=0.1, dim_feedforward=2048, activation="relu", layer_norm_eps=1e-5,
@@ -39,9 +40,9 @@ if moe:
                             num_expert=NUMEXPERTS, top_k=TOPK, activation=self.activation_with_dropout)
                 self.linear1, self.linear2 = None, None
             if SHARED > 0:
-                self.linear1_shared = nn.Linear(d_model, int(dim_feedforward / div_by), bias=bias)
+                self.linear1_shared = nn.Linear(d_model, int(dim_feedforward / div_by_shared), bias=bias)
                 self.dropout_shared = nn.Dropout(dropout)
-                self.linear2_shared = nn.Linear(int(dim_feedforward / div_by), d_model, bias=bias)
+                self.linear2_shared = nn.Linear(int(dim_feedforward / div_by_shared), d_model, bias=bias)
 
             if harmonic:
                 self.avg_expert_idx = 0 # for harmonic MoE
@@ -61,7 +62,7 @@ if moe:
                     ret = {}
                 elif harmonic:
                     x = self.moe_ffn(x, ret)
-                    self.avg_expert_idx += ret.get("avg_expert_idx", 0).item()
+                    self.avg_expert_idx += ret.get("avg_expert_idx", 0)
                 else:
                     x = self.moe_ffn(x)
             else:
@@ -86,9 +87,9 @@ if moe:
                 self.linear2, self.linear1 = None, None
 
             if SHARED > 0:
-                self.linear1_shared = nn.Linear(d_model, int(dim_feedforward / div_by), bias=bias)
+                self.linear1_shared = nn.Linear(d_model, int(dim_feedforward / div_by_shared), bias=bias)
                 self.dropout_shared = nn.Dropout(dropout)
-                self.linear2_shared = nn.Linear(int(dim_feedforward / div_by), d_model, bias=bias)
+                self.linear2_shared = nn.Linear(int(dim_feedforward / div_by_shared), d_model, bias=bias)
 
             if harmonic:
                 self.avg_expert_idx = 0 # for harmonic MoE
@@ -108,7 +109,7 @@ if moe:
                     ret = {}
                 elif harmonic:
                     x = self.moe_ffn(x, ret)
-                    self.avg_expert_idx += ret.get("avg_expert_idx", 0).item()
+                    self.avg_expert_idx += ret.get("avg_expert_idx", 0)
                 else:
                     x = self.moe_ffn(x)
             else:
@@ -335,7 +336,7 @@ class AutoBotEgo(BaseModel):
         for _ in range(self.L_dec):
             self.tx_decoder.append(transformer_decoder_layer(d_model=self.d_k, nhead=self.num_heads,
                                                               dropout=self.dropout,
-                                                              dim_feedforward=self.tx_hidden_size*2 if decoder2x else self.tx_hidden_size))
+                                                              dim_feedforward=self.tx_hidden_size*decoder2x if decoder2x else self.tx_hidden_size))
         self.tx_decoder = nn.ModuleList(self.tx_decoder)
 
         # ============================== Positional encoder ==============================
@@ -559,17 +560,25 @@ class AutoBotEgo(BaseModel):
     def get_loss(self, batch, prediction):
         inputs = batch['input_dict']
         ground_truth = torch.cat([inputs['center_gt_trajs'][..., :2], inputs['center_gt_trajs_mask'].unsqueeze(-1)],
-                                 dim=-1)
+                                dim=-1)
         loss = self.criterion(prediction, ground_truth, inputs['center_gt_final_valid_idx'])
         if harmonic and moe:
             avg_expert_idx = 0
             alpha = self.config['harmonic_alpha']
-            for transformer_type in [self.temporal_attn_layers, self.social_attn_layers]:
-                for layer in transformer_type:
+            if 'temporal' in moe_types:
+                for layer in self.temporal_attn_layers:
                     for sub_layer in layer.layers:
                         avg_expert_idx += sub_layer.avg_expert_idx
-            for layer in self.tx_decoder:
-                avg_expert_idx += layer.avg_expert_idx
+                        sub_layer.avg_expert_idx = 0  # reset so it doesn't leak into the next forward pass
+            if 'social' in moe_types:
+                for layer in self.social_attn_layers:
+                    for sub_layer in layer.layers:
+                        avg_expert_idx += sub_layer.avg_expert_idx
+                        sub_layer.avg_expert_idx = 0  # reset
+            if 'decoder' in moe_types:
+                for layer in self.tx_decoder:
+                    avg_expert_idx += layer.avg_expert_idx
+                    layer.avg_expert_idx = 0  # reset
             loss = loss + alpha * avg_expert_idx
         return loss
 

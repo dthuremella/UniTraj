@@ -2,6 +2,7 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import Callback
 from torch.utils.data import WeightedRandomSampler
+import torch.nn.functional as F
 
 torch.set_float32_matmul_precision('medium')
 from pytorch_lightning.loggers import WandbLogger
@@ -14,16 +15,103 @@ import hydra
 from omegaconf import OmegaConf
 import os
 
-from models.mtr.transformer.transformer_encoder_layer import viz, moe, SHARED, NUMEXPERTS, TOPK, upsample_hard, harmonic, diff_init, concatdim, first_agent, curr_timestep, final_timestep, cls_token, moe_types, decoder2x
+from models.mtr.transformer.transformer_encoder_layer import viz, moe, SHARED, NUMEXPERTS, TOPK, upsample_hard, harmonic, diff_init, concatdim, first_agent, curr_timestep, final_timestep, cls_token, moe_types, decoder2x, epithet, learnable_targets
 
 if moe:
-    moe_name = f'fmoe-{TOPK}k{SHARED}s{NUMEXPERTS}e{"S" if "social" in moe_types else ""}{"T" if "temporal" in moe_types else ""}{"D" if "decoder" in moe_types else ""}{"_upsample" if upsample_hard else ""}{"_harmonic" if harmonic else ""}{"_diffinit" if diff_init else ""}{"_concatdim" if concatdim else ""}{"_agent0" if first_agent else ""}{"_currT" if curr_timestep else ""}{"_finalT" if final_timestep else ""}{"_cls" if cls_token else ""}-' 
+    from models.mtr.transformer.transformer_encoder_layer import GSoftmaxHarmonicGate
+    moe_name = f'fmoe-{TOPK}k{SHARED}s{NUMEXPERTS}e{"S" if "social" in moe_types else ""}{"T" if "temporal" in moe_types else ""}{"D" if "decoder" in moe_types else ""}{"_upsample" if upsample_hard else ""}{epithet}{"_harmonic" if harmonic else ""}{"_diffinit" if diff_init else ""}{"_concatdim" if concatdim else ""}{"_agent0" if first_agent else ""}{"_currT" if curr_timestep else ""}{"_finalT" if final_timestep else ""}{"_cls" if cls_token else ""}-' 
 else:
-    moe_name = f'{"_upsample" if upsample_hard else ""}{"_decoder2x" if decoder2x else ""}'
+    moe_name = f'{"_upsample" if upsample_hard else ""}{"_decoder{}x".format(decoder2x) if decoder2x else ""}'
 
 restore_best_weights = False  # Set to True to enable restoring best weights after each validation
 print( f"RESTORE best weights after each validation: {restore_best_weights}")
 taper_tau = False #doesnt seem to help
+per_batch_learntarg = False
+
+monitor_metric = 'val/brier_fde' ## tried 'val/minFDE6' to try to reproduce
+
+class EMTargetCallback(Callback):
+    def __init__(self, target_lr=1e-3):
+        super().__init__()
+        self.target_lr = target_lr
+        self.optimizer_target = None
+
+    def on_fit_start(self, trainer, pl_module):
+        target_params = [p for n, p in pl_module.named_parameters() 
+                         if 'target_logits' in n]
+        if not target_params:
+            print("[EMTargetCallback] No target_logits found — callback inactive.")
+            return
+        self.optimizer_target = torch.optim.Adam(target_params, lr=self.target_lr)
+        self.optimizer_target.zero_grad()  # clean slate
+        self._n_batches = 0
+        print(f"[EMTargetCallback] Found {len(target_params)} target_logit tensors.")
+
+    def _set_update_targets(self, pl_module, flag: bool):
+        if 'temporal' in moe_types:
+            for layer in pl_module.temporal_attn_layers:
+                for sub_layer in layer.layers:
+                    sub_layer.moe_ffn.gate.update_targets = flag
+        if 'social' in moe_types:
+            for layer in pl_module.social_attn_layers:
+                for sub_layer in layer.layers:
+                    sub_layer.moe_ffn.gate.update_targets = flag
+        if 'decoder' in moe_types:
+            for layer in pl_module.tx_decoder:
+                layer.moe_ffn.gate.update_targets = flag
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        # Reset accumulation counter each epoch
+        self._n_batches = 0
+        # Make sure target_logits grads are clean at epoch start
+        if self.optimizer_target is not None:
+            self.optimizer_target.zero_grad()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+
+        if self.optimizer_target is None:
+            return
+        # Freeze model weights, unfreeze target_logits
+        for n, p in pl_module.named_parameters():
+            p.requires_grad_('target_logits' in n)
+        self._set_update_targets(pl_module, True)
+
+        # Second forward pass — need a fresh graph
+        pl_module.train()  # ensure train mode
+        with torch.enable_grad():
+            # Call the underlying forward + loss directly, bypassing Lightning's graph management
+            loss = pl_module.training_step(batch, batch_idx)
+            loss.backward()
+            if per_batch_learntarg:
+                self.optimizer_target.step()       # update target_logits right away
+                self.optimizer_target.zero_grad()  # clear grad for the next batch
+
+        self._n_batches += 1
+
+        # Restore normal state
+        self._set_update_targets(pl_module, False)
+        for n, p in pl_module.named_parameters():
+            p.requires_grad_('target_logits' not in n)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self.optimizer_target is None or self._n_batches == 0:
+            return
+
+        # # Normalise accumulated gradients by number of batches
+        # for n, p in pl_module.named_parameters():
+        #     if 'target_logits' in n and p.grad is not None:
+        #         p.grad /= self._n_batches
+
+        if not per_batch_learntarg:
+            # Single M-step per epoch
+            self.optimizer_target.step()
+            self.optimizer_target.zero_grad()
+
+        # # Log learned targets
+        # for n, p in pl_module.named_parameters():
+        #     if 'target_logits' in n:
+        #         learned = F.softmax(p.detach(), dim=0).tolist()
+        #         print(f"[EMTargetCallback] {n}: {[f'{v:.3f}' for v in learned]}")
 
 class HardExampleSamplerCallback(Callback):
     """Tracks per-sample loss and rebuilds the train DataLoader sampler each epoch."""
@@ -128,7 +216,7 @@ class RestoreBestWeights(Callback):
     def __init__(self):
         self.best_weights = None
         self.best_score = float('inf')
-        self.monitor = 'val/brier_fde'
+        self.monitor = monitor_metric
         self.mode = 'min'
     
     def on_validation_end(self, trainer, pl_module):
@@ -156,8 +244,8 @@ class RestoreBestWeights(Callback):
 class MetricsPrinterCallback(Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         metrics = trainer.callback_metrics
-        if 'val/brier_fde' in metrics:
-            print(f"\nEpoch {trainer.current_epoch}: val/brier_fde = {metrics['val/brier_fde']:.4f}")
+        if monitor_metric in metrics:
+            print(f"\nEpoch {trainer.current_epoch}: {monitor_metric} = {metrics[monitor_metric]:.4f}")
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def train(cfg):
@@ -176,9 +264,9 @@ def train(cfg):
     call_backs = []
 
     checkpoint_callback = ModelCheckpoint(
-        dirpath=f'/home/x_divth/project/code/moe/UniTraj/checkpoints/{cfg.tx_hidden_size if not moe else ""}{moe_name}{cfg.harmonic_alpha if harmonic else ""}{cfg.method.model_name}/',
-        monitor='val/brier_fde',  # Replace with your validation metric
-        filename='{epoch}-{val/brier_fde:.2f}',
+        dirpath=f'/home/x_divth/project/code/moe/UniTraj/checkpoints/{cfg.tx_hidden_size if not moe else ""}{moe_name}{cfg.harmonic_alpha if harmonic else ""}{cfg.method.model_name}{"perbatch" if per_batch_learntarg else ""}{monitor_metric[4:8]}/',
+        monitor=monitor_metric,  # Replace with your validation metric
+        filename='{epoch}-{val/minFDE6:.2f}',
         save_top_k=1, # save the top k checkpoints, set to -1 to save all checkpoints
         every_n_epochs=1,  # evaluate every n epochs
         save_last=True,  # Always keep the last checkpoint
@@ -197,6 +285,8 @@ def train(cfg):
         hard_sampler_cb = HardExampleSamplerCallback(train_set, train_batch_size, cfg)
         call_backs.append(hard_sampler_cb)
         model.train_dataloader = hard_sampler_cb._build_loader
+    if harmonic and learnable_targets:
+        call_backs.append(EMTargetCallback(target_lr=1e-3))  # can tune this lr separately
 
     train_loader = DataLoader(
         train_set, batch_size=train_batch_size, num_workers=cfg.load_num_workers, drop_last=False,

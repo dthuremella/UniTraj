@@ -12,42 +12,93 @@ from typing import Optional
 
 import torch.nn.functional as F
 from torch import nn, Tensor
+import torch
 
 from .multi_head_attention import MultiheadAttention
 from .multi_head_attention_local import MultiheadAttentionLocal
 
 from fmoe.layers import _fmoe_general_global_forward, fmoe_faster_schedule
 
+###############################################################
 # options for all models:
 viz = False
-decoder2x = False # (for baseline model) making the decoder twice the size
+decoder2x = False # 2 # (for baseline model) making the decoder twice the size
 upsample_hard = False
 
 # options for MOE models only:
-moe = False
-NUMEXPERTS = 32
-TOPK = 2
-SHARED = 0
+moe = True
+NUMEXPERTS = 8
+TOPK = 1
+SHARED = 1  ### autobot.py for shared div_by
 
 first_agent = False # only use the first agent's tokens for routing
 curr_timestep = False # only use the current timestep's tokens for routing
 final_timestep = False # only use the final (in the decoder) timestep's tokens for routing
 cls_token = False # add a CLS token and only use it for routing
+
+two_layer_router = False 
+
+moe_types = ['decoder'] # social, temporal, decoder
+
+harmonic = False # alpha is in autobot.yaml, NUMEXPERTS needs to be divisible by 6  for this to work
+
+which_ratios = '' #'equal8x' # '' (to turn off), 'equal'  'lt' or 'evenharmonic'
+which_targets = '' #'kldiv8x'  # '' (to turn off), 'kldiv_topkratios', 'kldiv_equalinit'
+
+learnable_targets = False # by default, use Expectation Maximization method
+entropy_alpha = 0.01  # weight for the learnable targets loss, original is 0.01, effectively multiplied by harmoic_bias_loss
+
+lower_flops = False
+lower_flops_alpha = 0.1  # weight for the lower flops loss, original is 0.01, effectively multiplied by harmoic_bias_loss
+
+###############################################################
+if which_ratios:
+    epithet = f"_{which_ratios}ratio_{which_targets}{('_learntarg'+str(entropy_alpha)) if learnable_targets else ''}{('lowerflops'+str(lower_flops_alpha)) if lower_flops else ''}"
+else:
+    epithet = ""
+
 T_OBS = 21 # don't hardcode, change later TODO
 T_FUT = 60 # don't hardcode, change later
 NUM_PREDS = 6 # don't hardcode, change later
 NUM_AGENTS = 65 # don't hardcode, change later
 
-two_layer_router = False 
-
-harmonic = False # NUMEXPERTS needs to be divisible by 8  for this to work
 # ratios = [0, 1.0/8, 1.0/4, 1.0/2, 3.0/4, 1.0, 1.5, 2.0] # for shared
-ratios = [1.0/8, 1.0/4, 1.0/2, 3.0/4, 1.0, 1.5, 2.0, 2.5] # for not shared
+# ratios = [1.0/8, 1.0/4, 1.0/2, 3.0/4, 1.0, 1.5, 2.0, 2.5] # for not shared
+if which_ratios == 'equal':
+    ratios = [1, 1, 1, 1, 1, 1] # equal ratios
+elif which_ratios == 'equal8x':
+    ratios = [1, 1, 1, 1, 1, 1, 1, 1] # equal ratios
+elif which_ratios == 'equal4x':
+    ratios = [1, 1, 1, 1] # equal ratios
+elif which_ratios == 'equal2x':
+    ratios = [1, 1] # equal ratios
+elif which_ratios == 'lt':
+    ratios = [1.0/2, 1, 2, 3, 5, 10] # lt ratios
+elif which_ratios == 'evenharmonic':
+    ratios = [0, 1.0/8, 1.0/4, 1.0/2, 3.0/4, 1.0, 1.5, 2.0]
+else:
+    ratios = None
+
+if which_targets == 'kldiv':
+    targets = [0.8, 0.1, 0.05, 0.03, 0.01, 0.01] # (kldiv) should sum to 1, set this to NONE if not using KL divergence loss
+if which_targets == 'kldiv8x':
+    targets = [0.80, 0.094, 0.039, 0.022, 0.014, 0.011, 0.01, 0.01] # (kldiv) should sum to 1, set this to NONE if not using KL divergence loss
+if which_targets == 'kldiv4x':
+    targets = [0.80, 0.133, 0.057, 0.01]  # (kldiv) should sum to 1, set this to NONE if not using KL divergence loss
+if which_targets == 'kldiv2x':
+    targets = [0.80, 0.20] # (kldiv) should sum to 1, set this to NONE if not using KL divergence loss
+elif which_targets == 'kldiv_equalinit':
+    targets = [1.0/6, 1.0/6, 1.0/6, 1.0/6, 1.0/6, 1.0/6] # equal_init for targets
+else: 
+    targets = None
+if harmonic:
+    factor = int(NUMEXPERTS / len(ratios)) # Number of experts per ratio group
+if targets:
+    targets = torch.tensor(targets).repeat_interleave(factor) / factor
 
 diff_init = False # does not seem to help
 concatdim = False #DON'T USE! KILLS MEMORY
-
-moe_types = ['social', 'temporal', 'decoder'] # social, temporal, decoder
+gumbel_off = False # if true, turns off gumbel softmax and just uses regular softmax (which is what we want for harmonic with bias loss, since we want the scores to be more stable and not have the randomness of gumbel)
 
 if moe:
     print("MoE is enabled. NUMEXPERTS:", NUMEXPERTS, "TOPK:", TOPK, "SHARED:", SHARED, "harmonic:", harmonic, "first_agent:", first_agent, "curr_timestep:", curr_timestep, "final_timestep:", final_timestep, "cls_token:", cls_token)
@@ -127,8 +178,19 @@ if moe:
                         nn.ReLU(inplace=True),
                         nn.Linear(int(d_model / 2), self.tot_expert, bias = gate_bias),
                     )
+            self.num_expert = num_expert
 
-        def forward(self, inp, return_all_scores=False):
+            # Learnable logits over ratio groups — softmax gives valid distribution
+            if learnable_targets:
+                init = torch.tensor(targets, dtype=torch.float32)
+                # initialise in log space so softmax recovers roughly targets at step 0
+                self.target_logits = nn.Parameter(torch.log(init))
+                self.update_targets = False
+            else:
+                self.target_logits = None
+                self.update_targets = None
+
+        def forward(self, inp, return_all_scores=False, target=targets):
             r"""
             The naive implementation simply calculates the top-k of a linear layer's
             output.
@@ -139,13 +201,42 @@ if moe:
             )  # [.. x top_k]
             gate_top_k_val = gate_top_k_val.view(-1, self.top_k)
 
-            gate_score = F.gumbel_softmax(gate_top_k_val, tau=self.tau, hard=(not self.training))
+            gate_score = F.gumbel_softmax(gate_top_k_val, tau=self.tau, hard=(gumbel_off or not self.training))
 
-            # Compute average expert index weighted by scores
-            # Shape: gate_top_k_idx (batch*seq, top_k), gate_score (batch*seq, top_k)
-            factor = NUMEXPERTS / len(ratios)  # Number of experts per ratio group
-            ratios_based_idx = (gate_top_k_idx / factor).int() # Convert to (0, 7)
-            avg_expert_idx = (ratios_based_idx.float() * gate_score).sum(dim=-1).mean()
+            if target is not None: # kldiv
+                # gate_score shape: (batch*seq, top_k) -> (batch*seq, num_experts)
+                # Scatter top-k scores back into full expert dimension
+                full_scores = torch.zeros(gate_score.shape[0], self.num_expert, device=gate_score.device)
+                full_scores.scatter_(1, gate_top_k_idx, gate_score)  # (batch*seq, num_experts)
+
+                actual_dist = F.softmax(gate.view(-1, self.num_expert), dim=-1).mean(dim=0)  # (num_experts,), sums to 1
+
+                if learnable_targets:  
+                    target_distribution = F.softmax(self.target_logits, dim=0)  # target distribution is logits not probability so take softmax
+                    if self.update_targets:
+                        entropy = -(target_distribution * target_distribution.log()).sum()
+                        target_flops = torch.sum(torch.tensor(torch.tensor(ratios).repeat_interleave(factor), device=target_distribution.device) * target_distribution) if lower_flops else 0
+                        kl_loss = F.kl_div(target_distribution.log(), actual_dist.detach(), reduction='sum')
+                        avg_expert_idx = kl_loss + entropy_alpha * entropy + lower_flops_alpha * target_flops
+                    else: 
+                        avg_expert_idx = F.kl_div(actual_dist.log(), target_distribution.detach(), reduction='sum')
+
+                elif self.target_logits is not None: # we have learned targets from another model
+                    # Adjust gate_score to match target distribution
+                    target_distribution = torch.tensor(self.target_logits, device=gate_score.device).float() # we don't need to take softmax because the target we defined is already a probability
+                    avg_expert_idx = F.kl_div(actual_dist.log(), target_distribution, reduction='sum')
+
+                else:
+                    # Adjust gate_score to match target distribution
+                    target_distribution = torch.tensor(target, device=gate_score.device).float() # we don't need to take softmax because the target we defined is already a probability
+                    avg_expert_idx = F.kl_div(actual_dist.log(), target_distribution, reduction='sum')
+
+            else:
+                # Compute average expert index weighted by scores
+                # Shape: gate_top_k_idx (batch*seq, top_k), gate_score (batch*seq, top_k)
+                this_gate_factor = self.num_expert / len(ratios)  # Number of experts per ratio group
+                ratios_based_idx = (gate_top_k_idx / this_gate_factor).int() # Convert to (0, 7)
+                avg_expert_idx = (ratios_based_idx.float() * gate_score).sum(dim=-1).mean()
 
             # dummy loss
             self.set_loss(torch.zeros(1, requires_grad=True).to(inp.device))
